@@ -28,6 +28,7 @@ import shapefile
 from shapely.wkb import loads
 import simplejson as json
 from sqlalchemy import func
+from sqlalchemy import or_
 from tempfile import NamedTemporaryFile
 try:
     from StringIO import StringIO
