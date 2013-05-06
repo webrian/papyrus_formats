@@ -21,6 +21,7 @@ __date__ = "$Apr 29, 2013 6:55:21 AM$"
 
 from geoalchemy import functions
 import geojson
+import logging
 from papyrus.protocol import *
 import rpy2.rinterface as rinterface
 import rpy2.robjects as robjects
@@ -38,6 +39,7 @@ from zipfile import ZIP_DEFLATED
 from zipfile import ZipFile
 import xlwt
 
+log = logging.getLogger(__name__)
 
 # Map of EPSG codes to write the .prj files
 # taken from spatialreference.org
@@ -65,13 +67,13 @@ def logical_attr_filter(request, mapped_class):
     """
 
     mapping = {
-	'eq'   : '__eq__',
-	'ne'   : '__ne__',
-	'lt'   : '__lt__',
-	'lte'  : '__le__',
-	'gt'   : '__gt__',
-	'gte'  : '__ge__',
-	'like' : 'like',
+	'eq': '__eq__',
+	'ne': '__ne__',
+	'lt': '__lt__',
+	'lte': '__le__',
+	'gt': '__gt__',
+	'gte': '__ge__',
+	'like': 'like',
 	'ilike': 'ilike'
     }
 
@@ -348,11 +350,21 @@ class FormatsProtocol(Protocol):
 
         requested_attrs = request.params.get("attrs").split(",")
 
-        w = shapefile.Writer(shapefile.POLYGON)
-        w.autoBalance = 1
-
         # Get the first feature to guess the datatype
         first_record = query.first()
+
+        # Create geometry from AsBinary query
+        first_geom = loads(str(getattr(first_record, 'geometry_column')))
+
+        log.debug("Geometry type is %s" % first_geom.geom_type)
+
+        w = shapefile.Writer(shapefile.POLYGON)
+        if first_geom.geom_type == "Point":
+            w = shapefile.Writer(shapefile.POINT)
+        elif first_geom.geom_type == "LineString":
+            w = shapefile.Writer(shapefile.POLYLINE)
+
+        w.autoBalance = 1
 
         # Loop all requested attributes
         for attr in requested_attrs:
@@ -375,6 +387,22 @@ class FormatsProtocol(Protocol):
             # Create geometry from AsBinary query
             g = loads(str(getattr(i, 'geometry_column')))
 
+            # Handle point geometries
+            if g.geom_type == "Point":
+
+                w.point(g.coords[0][0], g.coords[0][1])
+
+            # Handle linestring geometries
+            if g.geom_type == "LineString":
+
+                point_list = []
+
+                for p in g.coords:
+                    point_list.append([p[0], p[1]])
+
+                w.line(parts=[point_list])
+
+            # Handle polygon geometries
             if g.geom_type == "Polygon":
 
                 ring_list = []
@@ -397,14 +425,14 @@ class FormatsProtocol(Protocol):
 
                 w.poly(shapeType=shapefile.POLYGON, parts=ring_list)
 
-                values = []
-                for v in requested_attrs:
-                    try:
-                        values.append(str(getattr(i, v)))
-                    except UnicodeEncodeError:
-                        values.append(str(getattr(i, v).encode("UTF-8")))
-                
-                w.record(* values)
+            values = []
+            for v in requested_attrs:
+                try:
+                    values.append(str(getattr(i, v)))
+                except UnicodeEncodeError:
+                    values.append(str(getattr(i, v).encode("UTF-8")))
+
+            w.record(* values)
 
         # Create the required files and fill them
         shp = StringIO()
