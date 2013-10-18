@@ -19,18 +19,14 @@
 __author__ = "Adrian Weber, Centre for Development and Environment, University of Bern"
 __date__ = "$Apr 29, 2013 6:55:21 AM$"
 
-from geoalchemy import functions
 import geojson
 import logging
 from papyrus.protocol import *
-import rpy2.rinterface as rinterface
-import rpy2.robjects as robjects
 import shapefile
 from shapely.wkb import loads
 import simplejson as json
 from sqlalchemy import func
 from sqlalchemy import or_
-from tempfile import NamedTemporaryFile
 try:
     from StringIO import StringIO
 except ImportError:
@@ -38,6 +34,12 @@ except ImportError:
 from zipfile import ZIP_DEFLATED
 from zipfile import ZipFile
 import xlwt
+import matplotlib
+matplotlib.use("Agg")
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.mlab as mlab
+from matplotlib.font_manager import FontProperties
 
 log = logging.getLogger(__name__)
 
@@ -109,29 +111,6 @@ def logical_attr_filter(request, mapped_class):
 
 class FormatsProtocol(Protocol):
 
-    def _query(self, request, filter=None, execute=True):
-        """ Build a query based on the filter and the request params,
-            and send the query to the database. """
-        limit = None
-        offset = None
-        if 'maxfeatures' in request.params:
-            limit = int(request.params['maxfeatures'])
-        if 'limit' in request.params:
-            limit = int(request.params['limit'])
-        if 'offset' in request.params:
-            offset = int(request.params['offset'])
-        if filter is None:
-            filter = create_filter(request, self.mapped_class, self.geom_attr)
-        query = self.Session().query(self.mapped_class).filter(filter)
-        order_by = self._get_order_by(request)
-        if order_by is not None:
-            query = query.order_by(order_by)
-        query = query.limit(limit).offset(offset)
-        if execute:
-            return query.all()
-        else:
-            return query
-
     def read(self, request, filter=None, id=None, format='geojson', ** kwargs):
         """
         Build a query based on the filter or the idenfier, send the query
@@ -158,19 +137,22 @@ class FormatsProtocol(Protocol):
             if id is not None:
                 query = self.Session.query(self.mapped_class).get(id)
             else:
-                query = self._query(request, filter, False)
+                query = self._query(request, None)
             return self._read_ext(request, query, filter=filter, name_mapping=kwargs['name_mapping'])
 
         if format == 'hist':
+            query = self.Session.query(self.mapped_class)
             if filter is None:
-                filter = create_default_filter(request, self.mapped_class)
-            return self._plot_histogram(request, self.Session.query(self.mapped_class).filter(filter), kwargs['categories'])
+                filter = create_filter(request, self.mapped_class, "wkb_geometry")
+            if filter is not None:
+                query.filter(filter)
+            return self._plot_histogram(request, query, categories=kwargs['categories'], filename=kwargs['filename'])
 
         if format == 'xls':
 
             metadata = kwargs.get("metadata", None)
 
-            query = self._query(request, filter, False)
+            query = self._query(request, filter)
             return self._read_xls(request, query, filter=filter, metadata=metadata)
 
         if format == 'shp':
@@ -204,7 +186,7 @@ class FormatsProtocol(Protocol):
 
         output['rows'] = []
 
-        for i in query.all():
+        for i in query: #.all():
             row = {}
             for k in attrs:
                 value = getattr(i, k)
@@ -240,7 +222,8 @@ class FormatsProtocol(Protocol):
         return json.dumps(output)
 
 
-    def _plot_histogram(self, request, query, categories=None):
+    """
+    def _plot_histogram(self, request, query, **kwargs):
 
         # Get the requested attribute
         attr = request.params.get('attrs').split(",")[0]
@@ -268,7 +251,11 @@ class FormatsProtocol(Protocol):
         mappedAttribute = getattr(self.mapped_class, attr)
 
         # Create a temporary file
-        file = NamedTemporaryFile()
+        if 'filename' in kwargs:
+            file = open(kwargs['filename'], 'wb')
+        else:
+            # Create a temporary file
+            file = NamedTemporaryFile()
         r.png(file.name, width=width, height=height)
         r.par(bg="#F0F0F0", mar=robjects.FloatVector([2.6, 4.1, 3.1, 1.1]))
 
@@ -276,7 +263,8 @@ class FormatsProtocol(Protocol):
 
         # If categories is not none, then the current attribute has categories and
         # we want to draw a barplot instead of a histogram
-        if categories is not None:
+        if "categories" in kwargs and kwargs['categories'] is not None:
+            categories = kwargs['categories']
 
             names = []
             v = []
@@ -307,7 +295,141 @@ class FormatsProtocol(Protocol):
 
         f = open(file.name, 'r')
 
-        return f
+        return f"""
+
+
+    def _plot_histogram(self, request, query, ** kwargs):
+        """
+        Alternative implementation with matplotlib instead of R
+        """
+
+        # Get the first requested attribute
+        attr = request.params.get('attrs').split(",")[0]
+
+        # Set a default value for the image size in pixel
+        defaultSide = 480.0
+        # Set the dpi
+        dpi = 96.0
+
+        try:
+            height = float(request.params.get("height", defaultSide))
+        except ValueError:
+            height = defaultSide
+        try:
+            width = float(request.params.get("width", defaultSide))
+        except ValueError:
+            width = defaultSide
+
+        mappedAttribute = getattr(self.mapped_class, attr)
+
+        fig = plt.figure(figsize=(width / dpi, height / dpi))
+        ax = fig.add_subplot(111)
+
+        # Set fontProperties
+        fontProperties = FontProperties(family="sans-serif", size='x-small')
+
+        # Set smaller fonts
+        [i.set_fontproperties(fontProperties) for i in ax.get_yticklabels()]
+        [j.set_fontproperties(fontProperties) for j in ax.get_xticklabels()]
+
+        # If categories is not none, then the current attribute has categories and
+        # we want to draw a barplot instead of a histogram
+        if kwargs["categories"] is not None:
+
+            categories = kwargs["categories"]
+
+            v = []
+            names = []
+            for a, count in query.from_self(mappedAttribute, func.count(mappedAttribute)).filter(mappedAttribute.in_(categories.keys())).group_by(mappedAttribute):
+                v.append(int(count))
+                names.append(categories[unicode(a)].encode('UTF-8'))
+
+            N = len(v)
+
+            ind = range(N)
+
+            # the histogram of the data
+            ax.bar(np.array(ind) + 0.1, v, width=0.8, color=kwargs.get("color"))
+
+            # hist uses np.histogram under the hood to create 'n' and 'bins'.
+            # np.histogram returns the bin edges, so there will be 50 probability
+            # density values in n, 51 bin edges in bins and 50 patches.  To get
+            # everything lined up, we'll compute the bin centers
+            ax.set_xticks(np.arange(len(v)) + 0.5)
+            ax.set_xticklabels(names)
+
+        else:
+
+            # Get the number of distinct values
+            distinct_value = query.from_self(mappedAttribute).distinct(mappedAttribute).count()
+
+            # Limit the breaks to 100
+            if distinct_value > 100:
+                distinct_value = 100
+            # In case of less distinct values, limit the number of breaks
+            elif distinct_value > 20 and distinct_value < 100:
+                distinct_value = int(distinct_value / 2)
+
+            v = [i for i, in query.from_self(mappedAttribute).all()]
+
+            # the histogram of the data
+            n, bins, patches = ax.hist(v, bins=distinct_value, facecolor=kwargs.get("color"), alpha=0.75)
+
+            """
+            n, bins = np.histogram(v, distinct_value)
+
+            # get the corners of the rectangles for the histogram
+            left = np.array(bins[:-1])
+            right = np.array(bins[1:])
+            bottom = np.zeros(len(left))
+            top = bottom + n
+            nrects = len(left)
+
+            nverts = nrects*(1+3+1)
+            verts = np.zeros((nverts, 2))
+            codes = np.ones(nverts, int) * matplotlib.path.Path.LINETO
+            codes[0::5] = matplotlib.path.Path.MOVETO
+            codes[4::5] = matplotlib.path.Path.CLOSEPOLY
+            verts[0::5,0] = left
+            verts[0::5,1] = bottom
+            verts[1::5,0] = left
+            verts[1::5,1] = top
+            verts[2::5,0] = right
+            verts[2::5,1] = top
+            verts[3::5,0] = right
+            verts[3::5,1] = bottom
+
+            barpath = matplotlib.path.Path(verts, codes)
+            patch = matplotlib.patches.PathPatch(barpath, facecolor=kwargs.get("color"), alpha=0.75)
+            ax.add_patch(patch)
+
+            ax.set_xlim(0, right[-1])
+            ax.set_ylim(bottom.min(), top.max())
+            """
+
+            # hist uses np.histogram under the hood to create 'n' and 'bins'.
+            # np.histogram returns the bin edges, so there will be 50 probability
+            # density values in n, 51 bin edges in bins and 50 patches.  To get
+            # everything lined up, we'll compute the bin centers
+
+        if 'xlabel' in kwargs:
+            ax.set_xlabel(kwargs['xlabel'], fontproperties=fontProperties)
+        if 'ylabel' in kwargs:
+            ax.set_ylabel(kwargs['ylabel'], fontproperties=fontProperties)
+
+
+        ax.grid(True)
+
+        if "filename" in kwargs:
+            file = open("filename", 'wb')
+            fig.savefig(kwargs["filename"], dpi=dpi, format="png")
+        else:
+            file = StringIO()
+            fig.savefig(file, dpi=dpi, format="png")
+
+        file.seek(0)  # rewind the data
+
+        return file
 
     def _read_xls(self, request, query, ** kwargs):
 
@@ -324,7 +446,7 @@ class FormatsProtocol(Protocol):
 
         row += 1
         
-        for i in query.all():
+        for i in query: #.all():
             column = 0
             for a in requested_attrs:
                 sheet.write(row, column, getattr(i, a))
